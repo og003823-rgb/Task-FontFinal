@@ -1,117 +1,237 @@
-import React, { useState, useEffect } from 'react';
-import { fetchTasks, updateTask } from './api.js';
+import React, { useEffect, useReducer, useRef, useState } from 'react';
+import { fetchTasks, saveTasks } from './api.js';
 
 const PRIORITY_WEIGHT = { Urgent: 3, High: 2, Medium: 1, Low: 0 };
 const LOW_STOCK_LIMIT = 15;
+const MAX_UNDO_STEPS = 50;
+
+const initialState = {
+  tasks: [],
+  selectedIds: [],
+  history: [],
+  sortDirection: 'desc',
+};
+
+function withHistory(state, changes) {
+  return {
+    ...state,
+    ...changes,
+    history: [
+      ...state.history,
+      {
+        tasks: state.tasks,
+        selectedIds: state.selectedIds,
+        sortDirection: state.sortDirection,
+      },
+    ].slice(-MAX_UNDO_STEPS),
+  };
+}
+
+function dashboardReducer(state, action) {
+  switch (action.type) {
+    case 'LOAD':
+      return { ...initialState, tasks: action.tasks };
+    case 'TOGGLE_SELECT': {
+      const selectedIds = state.selectedIds.includes(action.id)
+        ? state.selectedIds.filter((id) => id !== action.id)
+        : [...state.selectedIds, action.id];
+      return withHistory(state, { selectedIds });
+    }
+    case 'SET_STOCK': {
+      const task = state.tasks.find((item) => item.id === action.id);
+      if (!task || task.stockUnits === action.stockUnits) return state;
+      return withHistory(state, {
+        tasks: state.tasks.map((item) =>
+          item.id === action.id ? { ...item, stockUnits: action.stockUnits } : item
+        ),
+      });
+    }
+    case 'SET_NOTE': {
+      const task = state.tasks.find((item) => item.id === action.id);
+      if (!task || task.note === action.note) return state;
+      return withHistory(state, {
+        tasks: state.tasks.map((item) =>
+          item.id === action.id ? { ...item, note: action.note } : item
+        ),
+      });
+    }
+    case 'BULK_COMPLETE': {
+      const ids = new Set(action.ids);
+      if (!state.tasks.some((task) => ids.has(task.id) && task.status !== 'Completed')) {
+        return state;
+      }
+      return withHistory(state, {
+        tasks: state.tasks.map((task) =>
+          ids.has(task.id) ? { ...task, status: 'Completed' } : task
+        ),
+      });
+    }
+    case 'BULK_RESTOCK': {
+      const ids = new Set(action.ids);
+      if (!state.tasks.some((task) => ids.has(task.id))) return state;
+      return withHistory(state, {
+        tasks: state.tasks.map((task) =>
+          ids.has(task.id)
+            ? { ...task, stockUnits: Math.min(Number.MAX_SAFE_INTEGER, task.stockUnits + 10) }
+            : task
+        ),
+      });
+    }
+    case 'SORT_PRIORITY': {
+      const sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
+      const direction = sortDirection === 'asc' ? 1 : -1;
+      return withHistory(state, {
+        sortDirection,
+        tasks: [...state.tasks].sort((a, b) => {
+          const difference =
+            (PRIORITY_WEIGHT[a.priority] - PRIORITY_WEIGHT[b.priority]) * direction;
+          return difference || a.id.localeCompare(b.id, undefined, { numeric: true });
+        }),
+      });
+    }
+    case 'REVERSE':
+      return withHistory(state, { tasks: [...state.tasks].reverse() });
+    case 'UNDO': {
+      if (state.history.length === 0) return state;
+      return {
+        ...state.history[state.history.length - 1],
+        history: state.history.slice(0, -1),
+      };
+    }
+    default:
+      return state;
+  }
+}
 
 export default function App() {
-  const [tasks, setTasks] = useState([]);
-  const [selectedTaskIds, setSelectedTaskIds] = useState([]);
+  const [state, dispatch] = useReducer(dashboardReducer, initialState);
+  const { tasks, selectedIds, history } = state;
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [priorityFilter, setPriorityFilter] = useState('All');
-  const [isSearching, setIsSearching] = useState(false);
-
+  const [stockDrafts, setStockDrafts] = useState({});
   const [countdown, setCountdown] = useState(5);
   const [saveCount, setSaveCount] = useState(0);
   const [lastSavedPayload, setLastSavedPayload] = useState(null);
-
-  const [history, setHistory] = useState([]);
-  const sortDirection = React.useRef('desc');
-
-  useEffect(() => {
-    setIsSearching(true);
-    fetchTasks(searchQuery, categoryFilter).then((results) => {
-      setTasks(results);
-      setIsSearching(false);
-    });
-  }, [searchQuery, categoryFilter]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
+  const snapshotRef = useRef(null);
+  const savingRef = useRef(false);
 
   useEffect(() => {
-    setHistory([
-      ...history,
-      { tasks, selectedTaskIds, at: Date.now() },
-    ]);
-  }, [tasks, selectedTaskIds]);
+    let isMounted = true;
+    fetchTasks()
+      .then((loadedTasks) => {
+        if (isMounted) dispatch({ type: 'LOAD', tasks: loadedTasks });
+      })
+      .catch((loadError) => {
+        if (isMounted) setError(`Unable to load tasks: ${loadError.message}`);
+      })
+      .finally(() => {
+        if (isMounted) setIsLoading(false);
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  snapshotRef.current = {
+    tasks,
+    selectedIds,
+    searchQuery,
+    categoryFilter,
+    priorityFilter,
+  };
 
   useEffect(() => {
     let ticks = 5;
-    const timer = setInterval(() => {
+    const interval = setInterval(() => {
       ticks -= 1;
-      setCountdown(ticks);
-      if (ticks === 0) {
-        ticks = 5;
-        setCountdown(5);
-        setSaveCount(saveCount + 1);
-        setLastSavedPayload({
-          savedAt: new Date().toLocaleTimeString(),
-          priorityFilter,
-          selectedTaskIds,
-        });
+      if (ticks > 0) {
+        setCountdown(ticks);
+        return;
       }
+
+      ticks = 5;
+      setCountdown(ticks);
+      if (savingRef.current || !snapshotRef.current.tasks.length) return;
+
+      const snapshot = snapshotRef.current;
+      savingRef.current = true;
+      setIsSaving(true);
+      saveTasks(snapshot.tasks)
+        .then(() => {
+          setLastSavedPayload({
+            ...snapshot,
+            savedAt: new Date().toLocaleTimeString(),
+          });
+          setSaveCount((count) => count + 1);
+          setError('');
+        })
+        .catch((saveError) => {
+          setError(`Unable to save tasks: ${saveError.message}`);
+        })
+        .finally(() => {
+          savingRef.current = false;
+          setIsSaving(false);
+        });
     }, 1000);
-    return () => clearInterval(timer);
+    return () => clearInterval(interval);
   }, []);
 
-  const handleUndo = () => {
-    if (history.length < 2) return;
-    const previous = history[history.length - 2];
-    setTasks(previous.tasks);
-    setSelectedTaskIds(previous.selectedTaskIds);
-    setHistory(history.slice(0, history.length - 1));
-  };
-
-  const handleSortByPriority = () => {
-    sortDirection.current = sortDirection.current === 'asc' ? 'desc' : 'asc';
-    const dir = sortDirection.current === 'asc' ? 1 : -1;
-    const sorted = tasks.sort(
-      (a, b) => (PRIORITY_WEIGHT[a.priority] - PRIORITY_WEIGHT[b.priority]) * dir
+  const query = searchQuery.trim().toLowerCase();
+  const displayedTasks = tasks.filter((task) => {
+    const matchesQuery =
+      !query ||
+      task.id.toLowerCase().includes(query) ||
+      task.title.toLowerCase().includes(query);
+    return (
+      matchesQuery &&
+      (categoryFilter === 'All' || task.category === categoryFilter) &&
+      (priorityFilter === 'All' || task.priority === priorityFilter)
     );
-    setTasks(sorted);
-  };
+  });
+  const visibleSelectedIds = displayedTasks
+    .filter((task) => selectedIds.includes(task.id))
+    .map((task) => task.id);
+  const visibleSelectedSet = new Set(visibleSelectedIds);
+  const totalUnits = displayedTasks.reduce((sum, task) => sum + task.stockUnits, 0);
+  const lowStockCount = displayedTasks.filter(
+    (task) => task.stockUnits < LOW_STOCK_LIMIT
+  ).length;
+  const completedCount = displayedTasks.filter(
+    (task) => task.status === 'Completed'
+  ).length;
 
-  const handleReverse = () => {
-    const reversed = tasks.reverse();
-    setTasks(reversed);
-  };
-
-  const handleToggleSelect = (taskId) => {
-    if (selectedTaskIds.includes(taskId)) {
-      setSelectedTaskIds(selectedTaskIds.filter((id) => id !== taskId));
-    } else {
-      setSelectedTaskIds([...selectedTaskIds, taskId]);
+  const handleStockChange = (taskId, rawValue) => {
+    setStockDrafts((drafts) => ({ ...drafts, [taskId]: rawValue }));
+    if (rawValue === '') return;
+    const value = Number(rawValue);
+    if (Number.isSafeInteger(value) && value >= 0) {
+      dispatch({ type: 'SET_STOCK', id: taskId, stockUnits: value });
     }
   };
 
-  const handleStockChange = (taskId, value) => {
-    setTasks(tasks.map((t) => (t.id === taskId ? { ...t, stockUnits: value } : t)));
-    updateTask(taskId, { stockUnits: value });
-  };
-
-  const handleBulkComplete = () => {
-    selectedTaskIds.forEach((id) => {
-      setTasks(tasks.map((t) => (t.id === id ? { ...t, status: 'Completed' } : t)));
-      updateTask(id, { status: 'Completed' });
+  const handleStockBlur = (taskId) => {
+    const draft = stockDrafts[taskId];
+    if (draft === undefined) return;
+    const value = Number(draft);
+    if (draft === '' || !Number.isSafeInteger(value) || value < 0) {
+      setError('Stock units must be a whole number greater than or equal to zero.');
+    } else {
+      setError('');
+    }
+    setStockDrafts((drafts) => {
+      const nextDrafts = { ...drafts };
+      delete nextDrafts[taskId];
+      return nextDrafts;
     });
   };
 
-  const handleBulkRestock = () => {
-    selectedTaskIds.forEach((id) => {
-      const target = tasks.find((t) => t.id === id);
-      if (!target) return;
-      const nextUnits = target.stockUnits + 10;
-      setTasks(tasks.map((t) => (t.id === id ? { ...t, stockUnits: nextUnits } : t)));
-      updateTask(id, { stockUnits: nextUnits });
-    });
+  const handleUndo = () => {
+    dispatch({ type: 'UNDO' });
   };
-
-  const displayedTasks = tasks.filter(
-    (task) => priorityFilter === 'All' || task.priority === priorityFilter
-  );
-
-  const totalUnits = displayedTasks.reduce((sum, t) => sum + t.stockUnits, 0);
-  const lowStockCount = displayedTasks.filter((t) => t.stockUnits < LOW_STOCK_LIMIT).length;
-  const completedCount = displayedTasks.filter((t) => t.status === 'Completed').length;
 
   return (
     <div className="app">
@@ -121,13 +241,13 @@ export default function App() {
           <p className="muted">Warehouse maintenance schedules, restock audits and field units.</p>
         </div>
         <div className="actions">
-          <button className="btn ghost" onClick={handleUndo} disabled={history.length < 2}>
-            Undo ({Math.max(history.length - 1, 0)})
+          <button className="btn ghost" onClick={handleUndo} disabled={!history.length}>
+            Undo ({history.length})
           </button>
-          <button className="btn primary" onClick={handleSortByPriority}>
+          <button className="btn primary" onClick={() => dispatch({ type: 'SORT_PRIORITY' })}>
             Sort by Priority
           </button>
-          <button className="btn primary" onClick={handleReverse}>
+          <button className="btn primary" onClick={() => dispatch({ type: 'REVERSE' })}>
             Reverse Order
           </button>
         </div>
@@ -136,7 +256,9 @@ export default function App() {
       <section className="grid-3">
         <div className="card">
           <span className="label">Auto-save</span>
-          <p className="big mono accent">Next auto-save in: {countdown} seconds</p>
+          <p className="big mono accent">
+            {isSaving ? 'Saving changes...' : `Next auto-save in: ${countdown} seconds`}
+          </p>
           <span className="muted small">Saves completed: {saveCount}</span>
         </div>
         <div className="card span-2">
@@ -148,6 +270,8 @@ export default function App() {
           </pre>
         </div>
       </section>
+
+      {error && <p className="error" role="alert">{error}</p>}
 
       <section className="grid-4">
         <div className="card stat">
@@ -173,15 +297,14 @@ export default function App() {
           <input
             type="text"
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(event) => setSearchQuery(event.target.value)}
             placeholder="Search by title or task code..."
           />
-          {isSearching && <span className="querying">Querying...</span>}
         </div>
         <div className="filters">
           <label>
             Category
-            <select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+            <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}>
               <option value="All">All</option>
               <option value="Inventory">Inventory</option>
               <option value="Hardware">Hardware</option>
@@ -190,7 +313,7 @@ export default function App() {
           </label>
           <label>
             Priority
-            <select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
+            <select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)}>
               <option value="All">All</option>
               <option value="Urgent">Urgent</option>
               <option value="High">High</option>
@@ -202,14 +325,20 @@ export default function App() {
       </section>
 
       <section className="bulkbar">
-        <span>
-          <strong>{selectedTaskIds.length}</strong> selected
-        </span>
+        <span><strong>{visibleSelectedIds.length}</strong> selected in current view</span>
         <div className="actions">
-          <button className="btn ghost" onClick={handleBulkRestock} disabled={!selectedTaskIds.length}>
+          <button
+            className="btn ghost"
+            onClick={() => dispatch({ type: 'BULK_RESTOCK', ids: visibleSelectedIds })}
+            disabled={!visibleSelectedIds.length}
+          >
             Restock +10
           </button>
-          <button className="btn ok" onClick={handleBulkComplete} disabled={!selectedTaskIds.length}>
+          <button
+            className="btn ok"
+            onClick={() => dispatch({ type: 'BULK_COMPLETE', ids: visibleSelectedIds })}
+            disabled={!visibleSelectedIds.length}
+          >
             Mark Complete
           </button>
         </div>
@@ -233,17 +362,20 @@ export default function App() {
             {displayedTasks.length === 0 ? (
               <tr>
                 <td colSpan="8" className="empty">
-                  No tasks match the current search or filter criteria.
+                  {isLoading
+                    ? 'Loading tasks...'
+                    : 'No tasks match the current search or filter criteria.'}
                 </td>
               </tr>
             ) : (
-              displayedTasks.map((task, index) => (
-                <tr key={index} className={selectedTaskIds.includes(task.id) ? 'selected' : ''}>
+              displayedTasks.map((task) => (
+                <tr key={task.id} className={visibleSelectedSet.has(task.id) ? 'selected' : ''}>
                   <td className="center">
                     <input
                       type="checkbox"
-                      checked={selectedTaskIds.includes(task.id)}
-                      onChange={() => handleToggleSelect(task.id)}
+                      checked={visibleSelectedSet.has(task.id)}
+                      onChange={() => dispatch({ type: 'TOGGLE_SELECT', id: task.id })}
+                      aria-label={`Select task ${task.id}`}
                     />
                   </td>
                   <td className="mono strong">{task.id}</td>
@@ -253,7 +385,7 @@ export default function App() {
                     <span className={`pill ${task.priority.toLowerCase()}`}>{task.priority}</span>
                   </td>
                   <td>
-                    <span className={`status ${task.status.replace(' ', '').toLowerCase()}`}>
+                    <span className={`status ${task.status.replace(/\s/g, '').toLowerCase()}`}>
                       {task.status}
                     </span>
                   </td>
@@ -261,12 +393,26 @@ export default function App() {
                     <input
                       className="units"
                       type="number"
-                      value={task.stockUnits}
-                      onChange={(e) => handleStockChange(task.id, e.target.value)}
+                      min="0"
+                      max={Number.MAX_SAFE_INTEGER}
+                      step="1"
+                      value={stockDrafts[task.id] ?? task.stockUnits}
+                      onChange={(event) => handleStockChange(task.id, event.target.value)}
+                      onBlur={() => handleStockBlur(task.id)}
+                      aria-label={`Stock units for ${task.id}`}
                     />
                   </td>
                   <td>
-                    <input className="note" type="text" placeholder="Quick manager note..." />
+                    <input
+                      className="note"
+                      type="text"
+                      placeholder="Quick manager note..."
+                      value={task.note ?? ''}
+                      onChange={(event) =>
+                        dispatch({ type: 'SET_NOTE', id: task.id, note: event.target.value })
+                      }
+                      aria-label={`Manager note for ${task.id}`}
+                    />
                   </td>
                 </tr>
               ))

@@ -1,4 +1,4 @@
-const serverDb = [
+let serverDb = [
   { id: 'TSK-101', title: 'Audit warehouse safety supplies', category: 'Inventory', priority: 'High', stockUnits: 45, status: 'In Progress' },
   { id: 'TSK-102', title: 'Restock barcode scanner batteries', category: 'Hardware', priority: 'Urgent', stockUnits: 12, status: 'Pending' },
   { id: 'TSK-103', title: 'Recalibrate conveyor scale sensor', category: 'Maintenance', priority: 'Low', stockUnits: 80, status: 'Completed' },
@@ -11,27 +11,51 @@ const serverDb = [
   { id: 'TSK-110', title: 'Reconcile damaged goods ledger', category: 'Inventory', priority: 'Urgent', stockUnits: 18, status: 'Pending' },
 ];
 
+const STORAGE_KEY = 'operations-dispatch-tasks';
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const fetchTasks = async (searchQuery, category) => {
-  const q = searchQuery.trim().toLowerCase();
-  await wait(q.length === 1 ? 1800 : 250);
+function isTaskList(value) {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (task) =>
+        task &&
+        typeof task.id === 'string' &&
+        typeof task.title === 'string' &&
+        typeof task.category === 'string' &&
+        typeof task.priority === 'string' &&
+        typeof task.status === 'string' &&
+        Number.isSafeInteger(task.stockUnits) &&
+        task.stockUnits >= 0 &&
+        (task.note === undefined || typeof task.note === 'string')
+    )
+  );
+}
 
-  return serverDb
-    .filter((task) => {
-      const matchesSearch =
-        !q ||
-        task.title.toLowerCase().includes(q) ||
-        task.id.toLowerCase().includes(q);
-      const matchesCategory = category === 'All' || task.category === category;
-      return matchesSearch && matchesCategory;
-    })
-    .map((task) => ({ ...task }));
-};
+export async function fetchTasks() {
+  await wait(100);
+  if (typeof window !== 'undefined') {
+    const savedTasks = window.localStorage.getItem(STORAGE_KEY);
+    if (savedTasks !== null) {
+      const parsedTasks = JSON.parse(savedTasks);
+      if (!isTaskList(parsedTasks)) {
+        throw new Error('Saved task data is invalid.');
+      }
+      serverDb = parsedTasks;
+    }
+  }
+  return serverDb.map((task) => ({ ...task }));
+}
 
-export const updateTask = async (id, patch) => {
-  await wait(120);
-  const target = serverDb.find((task) => task.id === id);
-  if (target) Object.assign(target, patch);
-  return target ? { ...target } : null;
-};
+export async function saveTasks(tasks) {
+  if (!isTaskList(tasks)) {
+    throw new Error('Task data is invalid and cannot be saved.');
+  }
+  await wait(100);
+  const snapshot = tasks.map((task) => ({ ...task }));
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+  }
+  serverDb = snapshot;
+  return snapshot.map((task) => ({ ...task }));
+}

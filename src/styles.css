@@ -27,6 +27,7 @@ body {
 h1 { margin: 0; font-size: 24px; letter-spacing: -0.02em; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
+.error { color: var(--danger); }
 .mono { font-family: 'JetBrains Mono', ui-monospace, Consolas, monospace; }
 .strong { font-weight: 600; }
 .center { text-align: center; }
